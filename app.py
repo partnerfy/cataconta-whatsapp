@@ -1,33 +1,31 @@
 # app.py
 import os
-import threading
 import re
 from flask import Flask, request, jsonify, Response
 from twilio.rest import Client
 
 app = Flask(__name__)
 
-# === Variáveis de ambiente (configure no Render > Environment) ===
-# - TWILIO_ACCOUNT_SID (Dashboard da Twilio)
+# === Variáveis de ambiente (Render > Environment) ===
+# - TWILIO_ACCOUNT_SID  (começa com AC...)
 # - TWILIO_AUTH_TOKEN
 # - TWILIO_WHATSAPP_FROM = whatsapp:+14155238886   # número do Sandbox
-# - STATUS_CALLBACK_URL = https://seuapp.onrender.com/twilio/status
+# - STATUS_CALLBACK_URL = https://SEUAPP.onrender.com/twilio/status  (opcional)
+TWILIO_SID        = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN      = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM       = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+STATUS_CALLBACK   = os.environ.get("STATUS_CALLBACK_URL", "")
 
-TWILIO_SID   = os.environ.get("TWILIO_ACCOUNT_SID", "")
-TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_FROM  = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
-STATUS_CALLBACK = os.environ.get("STATUS_CALLBACK_URL", "")
-
-# Cria o cliente Twilio (se houver credenciais)
+# Cria o cliente Twilio se houver credenciais
 client = Client(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
 
 
 # ---------------------------------------------------------------
-# FUNÇÕES AUXILIARES
+# AUXILIARES
 # ---------------------------------------------------------------
 def normalize_whatsapp_br(to_number: str) -> str:
     """
-    Se for número BR (+55) e vier sem o '9' após o DDD (somente 8 dígitos no final),
+    Se for BR (+55) e vier sem o '9' após o DDD (apenas 8 dígitos),
     insere o '9' automaticamente.
     Ex.: whatsapp:+554112345678 -> whatsapp:+55411912345678
     """
@@ -41,21 +39,29 @@ def normalize_whatsapp_br(to_number: str) -> str:
 
 
 def _send_whatsapp(to_number: str, text: str):
-    """Envia mensagem via API da Twilio em thread separada."""
-    if not client or not to_number or not to_number.startswith("whatsapp:"):
-        print("[TWILIO SKIP] client ausente ou 'to' inválido:", to_number)
+    """Envio SÍNCRONO (diagnóstico): loga tudo e dispara a mensagem via API."""
+    print(f"[DIAG] TWILIO_SID set? {bool(TWILIO_SID)}  "
+          f"TWILIO_TOKEN set? {bool(TWILIO_TOKEN)}  FROM={TWILIO_FROM}")
+    if not client:
+        print("[TWILIO SKIP] client ausente (credenciais não configuradas?)")
+        return
+    if not to_number or not to_number.startswith("whatsapp:"):
+        print(f"[TWILIO SKIP] 'to' inválido: {to_number}")
         return
     try:
         to_number = normalize_whatsapp_br(to_number)
+        print(f"[DIAG] Enviando via API: from={TWILIO_FROM} to={to_number} body='{text}'")
         msg = client.messages.create(
             from_=TWILIO_FROM,
             to=to_number,
             body=text,
             status_callback=STATUS_CALLBACK or None
         )
-        print(f"[TWILIO OK] sid={msg.sid} -> Enviando para {to_number}")
+        print(f"[TWILIO OK] sid={msg.sid}")
     except Exception as e:
-        print(f"[TWILIO ERROR] {e}")
+        import traceback
+        print("[TWILIO ERROR] Exception ao criar mensagem:")
+        traceback.print_exc()
 
 
 # ---------------------------------------------------------------
@@ -63,7 +69,7 @@ def _send_whatsapp(to_number: str, text: str):
 # ---------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    """Usado pelo Render para ver se o app está vivo."""
+    """Keep-alive/healthcheck."""
     return jsonify(ok=True)
 
 
@@ -72,14 +78,21 @@ def home():
     return "CataConta WhatsApp Webhook ativo!"
 
 
-@app.route("/whatsapp/webhook", methods=["POST"])
+@app.route("/whatsapp/webhook", methods=["POST", "GET"])
 def whatsapp_webhook():
     """
-    Webhook que o Twilio chama sempre que uma mensagem chega no Sandbox.
-    Lê o texto, envia uma resposta via API e devolve TwiML vazio (XML) para o Twilio.
+    Webhook chamado pelo Twilio a cada mensagem recebida no Sandbox.
+    - Lê o formulário (x-www-form-urlencoded)
+    - Envia a resposta SÍNCRONA via API Twilio (com logs detalhados)
+    - Retorna TwiML vazio (XML) para satisfazer o Twilio (evita 12300)
     """
+    if request.method == "GET":
+        # Algumas checagens/bots podem fazer GET: devolva TwiML vazio
+        return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                        mimetype="application/xml", status=200)
+
     from_number = request.form.get("From", "")       # ex.: 'whatsapp:+55...'
-    body        = request.form.get("Body", "")       # texto da mensagem
+    body        = request.form.get("Body", "")       # texto
     num_media   = int(request.form.get("NumMedia", "0"))
     media_url0  = request.form.get("MediaUrl0") if num_media > 0 else None
 
@@ -97,15 +110,11 @@ def whatsapp_webhook():
     else:
         reply_text = "✅ Recebi sua mensagem!"
 
-    # Envia a resposta ao usuário via API (thread separada)
+    # >>> Envio SÍNCRONO para garantir logs imediatos do que está acontecendo
     if from_number:
-        threading.Thread(
-            target=_send_whatsapp,
-            args=(from_number, reply_text),
-            daemon=True
-        ).start()
+        _send_whatsapp(from_number, reply_text)
 
-    # Retorna TwiML vazio (XML) para evitar erro 12300
+    # TwiML vazio (XML) para o Twilio ficar satisfeito
     return Response(
         '<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
         mimetype="application/xml",
@@ -116,9 +125,8 @@ def whatsapp_webhook():
 @app.route("/twilio/status", methods=["POST"])
 def twilio_status():
     """
-    Endpoint de callback de status das mensagens enviadas.
-    Mostra status de entrega (queued, sent, delivered, undelivered, failed)
-    e o código de erro (ex.: 63016 = número não fez join).
+    Callback de status de entrega.
+    Mostra: queued, sent, delivered, undelivered, failed + ErrorCode (ex.: 63016).
     """
     msid  = request.form.get("MessageSid")
     stat  = request.form.get("MessageStatus")
@@ -139,6 +147,8 @@ def twilio_status():
 
 # ---------------------------------------------------------------
 # EXECUÇÃO LOCAL (para testes)
+# Em produção (Render), use GUNICORN:
+#   gunicorn app:app -w 2 -k gthread -b 0.0.0.0:$PORT --timeout 30
 # ---------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
